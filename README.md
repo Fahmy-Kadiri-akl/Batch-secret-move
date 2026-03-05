@@ -1,14 +1,41 @@
+# Akeyless Static Secrets Migration Script
+
+Bash script to move Akeyless static secrets from a staging/holding path to their final application destination paths, **preserving all secret versions**.
+
+## Problem
+
+After migrating namespace secrets into Akeyless, all secrets land under a flat staging path:
+
+```
+/staging/<env>/<application_name>/<secret_key>
+```
+
+They need to be reorganized into the standard application path structure:
+
+```
+/<env>/<application_name>/static-secrets/<secret_key>
+```
+
 This script automates that move for all environments and applications in a single run.
 
 ## How It Works
 
-For each secret found under the source path, the script:
+The script uses two strategies per application folder, chosen automatically:
 
-1. **Reads** the secret value from the source path
-2. **Creates** a new secret at the destination path with the same value
-3. **Deletes** the original secret from the source path
+### Fast path: `move-objects` (preferred)
 
-Secrets are processed one at a time. If a create fails, the source is not deleted — no data loss is possible.
+When the target folder does **not** already exist, the script uses the Akeyless `move-objects` API. This is a single API call per app that preserves all secret versions, metadata, and tags natively.
+
+### Fallback: version-aware per-item copy
+
+When the target folder **already exists** (e.g. from a previous partial run), `move-objects` would incorrectly nest the source folder inside the target. The script detects this and falls back to per-item migration:
+
+1. Reads every version of the secret (`--version 1`, `--version 2`, ..., `--version N`)
+2. Creates the secret at the destination with version 1
+3. Adds versions 2..N using `update-secret-val --keep-prev-version true`
+4. Deletes the source secret
+
+If a create fails, the source is not deleted — no data loss is possible.
 
 ## Path Transformation
 
@@ -27,8 +54,8 @@ Target:  <target-prefix>/<env>/<app>/static-secrets/*
 ### Example
 
 ```
-Before:  /staging/prod/1015-bom-portal/db-password
-After:   /prod/1015-bom-portal/static-secrets/db-password
+Before:  /staging/prod/1015-bom-portal/db-password  (3 versions)
+After:   /prod/1015-bom-portal/static-secrets/db-password  (3 versions preserved)
 ```
 
 ## Prerequisites
@@ -41,7 +68,6 @@ After:   /prod/1015-bom-portal/static-secrets/db-password
 ## Installation
 
 ```bash
-# Clone or copy the script
 chmod +x migrate-staging-secrets.sh
 ```
 
@@ -89,10 +115,10 @@ Output:
 
 [INFO]  Environment: dev
 [INFO]    1015-bom-portal
-[WARN]      db-password → /dev/1015-bom-portal/static-secrets/db-password
-[WARN]      api-key → /dev/1015-bom-portal/static-secrets/api-key
+[WARN]      api-key (2 ver) → /dev/1015-bom-portal/static-secrets/api-key
+[WARN]      db-password (3 ver) → /dev/1015-bom-portal/static-secrets/db-password
 [INFO]    1234-sample-app
-[WARN]      redis-url → /dev/1234-sample-app/static-secrets/redis-url
+[WARN]      redis-url (1 ver) → /dev/1234-sample-app/static-secrets/redis-url
 
 [INFO]  === Done: 3 moved, 0 failed ===
 [WARN]  Dry run — re-run without --dry-run to execute.
@@ -163,10 +189,11 @@ The environment list is fully user-defined — use whatever names match your fol
    ./migrate-staging-secrets.sh --source /staging --envs dev
    ```
 
-3. **Verify** a few secrets at the destination:
+3. **Verify** a few secrets and their versions at the destination:
 
    ```bash
    akeyless get-secret-value --name /dev/1015-bom-portal/static-secrets/db-password
+   akeyless get-secret-value --name /dev/1015-bom-portal/static-secrets/db-password --version 1
    ```
 
 4. **Proceed** with remaining environments:
@@ -175,17 +202,28 @@ The environment list is fully user-defined — use whatever names match your fol
    ./migrate-staging-secrets.sh --source /staging --envs qa,preprod,prod
    ```
 
+## Migration Strategy Details
+
+The script chooses the migration strategy per application folder:
+
+| Condition | Strategy | Speed | Versions |
+|-----------|----------|-------|----------|
+| Target folder does not exist | `move-objects` | Fast (1 API call per app) | All preserved natively |
+| Target folder already exists | Per-item version copy | Slower (3+ API calls per secret) | All preserved via read+create+update |
+
+The target existence check prevents a known `move-objects` behavior where it nests the source folder name inside an existing target folder, producing incorrect paths like `/<env>/<app>/static-secrets/<app>/<secret>` instead of `/<env>/<app>/static-secrets/<secret>`.
+
 ## Error Handling
 
 | Scenario | Behavior |
 |----------|----------|
 | Secret value cannot be read | Logged as `FAIL read`, skipped, source untouched |
 | Secret cannot be created at destination | Logged as `FAIL create`, skipped, source untouched |
+| Individual version unreadable | Warning logged, other versions still migrated |
 | Source cannot be deleted after successful create | Warning logged, destination secret exists (manual cleanup needed) |
 | Environment folder is empty or missing | Warning logged, skipped to next environment |
-| Script interrupted mid-run | Safe to re-run — `create-secret` will fail on existing destinations, source secrets that were already moved are gone. Review and handle any partially-migrated apps manually. |
-
-The script exits with code `1` if any secrets failed, `0` on full success.
+| `move-objects` fails | Logged as error, counted as failure |
+| Script interrupted mid-run | Safe to re-run — fallback handles existing targets automatically |
 
 ## Exit Codes
 
